@@ -2,7 +2,7 @@
 
 Group messenger andriod application: Total and FIFO ordering (with failure handling)
 
-Decentralized Ordering
+Decentralized Ordering:
 The application implements ISIS algorithm to order messages and maintain consistency in the order of message delivery on all devices in the group. The algorithm is decentralized, that is there is no one 'master' device in the group that maintains the book-keeping and multicast the delivery order. Each device persist data in SQLite database.
 
 Failiure Safety:
