@@ -14,13 +14,19 @@ import android.view.View;
 import android.widget.EditText;
 import android.widget.TextView;
 
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.Serializable;
 import java.lang.reflect.Array;
 import java.net.InetAddress;
@@ -31,18 +37,24 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeoutException;
 
 
 /**
  * GroupMessengerActivity is the main Activity for the assignment.
  * 
- * @author stevko, avinav sharan
+ * @author stevko, avinavsh
  *
  */
 public class GroupMessengerActivity extends Activity {
@@ -54,18 +66,24 @@ public class GroupMessengerActivity extends Activity {
     static ArrayList<String> REMOTE_PORTS = new ArrayList<String>(Arrays.asList(REMOTE_PORTS_VAL));
     static int NO_OF_PROCS = 5;
     static final int REQ_TIMEOUT = 10000;
+    static final int ACK_MSG_TIMEOUT = 8000;
+    static final int AGREE_MSG_TIMEOUT = 12000;
     static final String AGREE = "agree", ACK = "ack", NEW = "new", DELIVER = "deliver";
 
     static int MY_PID , MY_EID = 0;
     static int id = -1;
     static final Uri mUri = buildUri("content", "edu.buffalo.cse.cse486586.groupmessenger2.provider");
 
-    static HashSet<String> msgSet = new HashSet<String>();
-    static HashSet<String> deliveredSet = new HashSet<String>();
-    static HashMap<String, Message1> idMap = new HashMap<String,Message1>();
-    static HashMap<String, HashSet<Message1>> agreedMap = new HashMap<String, HashSet<Message1>>();
-    static PriorityQueue<Message1> msgQueue = new PriorityQueue<Message1>(10, new MessageSort());
-
+//    static HashSet<String> msgSet = new HashSet<String>();
+//    static HashSet<String> deliveredSet = new HashSet<String>();
+    static Set<String> deliveredSet = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+//    static Hashtable<String, Message1> idMap = new Hashtable<String, Message1>();
+//    static Hashtable<String, HashSet<Message1>> agreedMap = new Hashtable<String, HashSet<Message1>>();
+    static ConcurrentHashMap<String, Message1> idMap = new ConcurrentHashMap<String, Message1>();
+    static ConcurrentHashMap<String, HashSet<Message1>> agreedMap = new ConcurrentHashMap<String, HashSet<Message1>>();
+    static PriorityBlockingQueue<Message1> msgQueue = new PriorityBlockingQueue<Message1>(10, new MessageSort());
+    static Hashtable<String, Timer> ackTimerTable = new Hashtable<String, Timer>();
+    static Hashtable<String, Timer> agreeTimerTable = new Hashtable<String, Timer>();
 
     Object lock1 = new Object();
     private static Uri buildUri(String scheme, String authority) {
@@ -174,8 +192,20 @@ public class GroupMessengerActivity extends Activity {
             try {
                 while(true) {
                     Socket socket = serverSocket.accept();
-                    ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-                    Message1 m = (Message1) in.readObject();
+//                    ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+                    BufferedReader br = new BufferedReader(
+                            new InputStreamReader(socket.getInputStream()));
+                    String msgStr = br.readLine();
+                    Log.e(TAG,"Msg Recieved:" +msgStr);
+                    String[] msgAtr = msgStr.split(",");
+                    String mid = msgAtr[0];
+                    int meid = Integer.parseInt(msgAtr[1]);
+                    int mpid = Integer.parseInt(msgAtr[2]);
+                    String mtype = msgAtr[3];
+                    String mtxt = msgAtr[4];
+                    Message1 m = new Message1(mtxt,mid,meid,mpid,mtype);
+//                    Message1 m = (Message1) in.readObject();
+                    Log.e(TAG,"ServerTask mid:" + m.mid);
                     publishProgress(m);
 
 
@@ -196,16 +226,16 @@ public class GroupMessengerActivity extends Activity {
             } catch (IOException e) {
                 Log.e(TAG, "Server IO Exception!");
                 e.printStackTrace();
-            } catch (ClassNotFoundException e) {
-                Log.e(TAG, "Server ClassNotFound Exception!");
-                e.printStackTrace();
+//            } catch (ClassNotFoundException e) {
+//                Log.e(TAG, "Server ClassNotFound Exception!");
+//                e.printStackTrace();
             }
             return null;
         }
 
-        protected void onProgressUpdate(Message1... m) {
+        protected synchronized void onProgressUpdate(Message1... m) {
             Log.e(TAG,"Here in server progress!");
-                new ProcessMessageTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,m);
+                new ProcessMessageTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,m);
 
 
 
@@ -221,58 +251,43 @@ public class GroupMessengerActivity extends Activity {
 
     private class ProcessMessageTask extends AsyncTask<Message1, String, Void> {
         @Override
-        protected Void doInBackground(Message1... msg) {
-            Log.e(TAG,"Here in process message task!");
+        protected synchronized Void doInBackground(Message1... msg) {
             Message1 m = msg[0];
+            Log.e(TAG,"Here in process message task! m.mid:" + m.mid);
             if (!idMap.containsKey(m.mid)) {
                 idMap.put(m.mid, m);
             }
-            HashSet<Message1> set = agreedMap.get(m.mid);
-            if (set == null) {
-                set = new HashSet<Message1>();
-                agreedMap.put(m.mid,set);
-            }
-//            idMap.put(m.mid, m);
             if (NEW.equals(m.type)) {// && m.pid != MY_PID) {
                 Log.e(TAG, "Here in processMsg new!");
-//                if (!msgSet.contains(m.mid)) {
+                if (m.pid != MY_PID) {
                     ++MY_EID;
                     m.eid = MY_EID;
-                    msgSet.add(m.mid);
-                    idMap.put(m.mid, m);
+                    Timer agreeTimer = new Timer();
+                    agreeTimer.schedule(new AgreeTimer(m.mid), AGREE_MSG_TIMEOUT);
+//                    agreeTimerTable.put(m.mid, agreeTimer);
+                }
+                idMap.put(m.mid, m);
+                msgQueue.offer(m);
+                publishProgress(ACK, m.mid, m.msgTxt);
+            } else if (ACK.equals(m.type)) {//&& m.pid != MY_PID) {
 
-                    set.add(m);
+                Log.e(TAG, "Here in processMsg ack! m.mid:" +m.mid + " from " + m.pid);
+                HashSet<Message1> set = agreedMap.get(m.mid);
+                if (set == null) {
+                    set = new HashSet<Message1>();
                     agreedMap.put(m.mid,set);
-//                    Integer count = agreedMap.get(m.mid);
-//                    if (count != null) {
-//                        agreedMap.put(m.mid, count + 1);
-//                    }
-//                    else {
-//                        agreedMap.put(m.mid, 1);
-//                    }
-                    msgQueue.offer(m);
-//                                synchronized (lock1) {
-                    if (m.pid != MY_PID) {
-                        publishProgress(ACK, m.mid, m.msgTxt);
-                    }
-//                                }
-//                }
-            } else if (ACK.equals(m.type) && m.pid != MY_PID) {
-                Log.e(TAG, "Here in processMsg ack!");
-//                Message1 old_msg = idMap.get(m.mid);
-//                if (old_msg != null) {
-//                    if (m.eid > old_msg.eid ||
-//                            (m.eid == old_msg.eid && m.pid > old_msg.pid)) {
-//                        update(m.mid, m.eid, m.pid);
-//                        deliver();
-//                    }
+                }
                     set.add(m);
-                    agreedMap.put(m.mid, set);
+//                    agreedMap.put(m.mid, set);
+                Log.e(TAG, "Here Set size:" +set.size());
                     Integer count = agreedMap.get(m.mid).size();
                     if(count != null) {
                         if (count == NO_OF_PROCS) {
 //                                        synchronized(lock1) {
 //                        updateQueue(m.mid, m.eid, m.pid);
+//                            Timer ackTimer = ackTimerTable.get(m.mid);
+//                            ackTimer.cancel();
+//                            ackTimer.purge();
                             set = agreedMap.get(m.mid);
                             int temp_eid = m.eid, temp_pid =m.pid;
                             for(Message1 ms : set) {
@@ -282,79 +297,178 @@ public class GroupMessengerActivity extends Activity {
                                     temp_pid = ms.pid;
                                 }
                             }
-                            update(m.mid, temp_eid, temp_pid);
+                            update(m.mid, temp_eid, temp_pid, 1);
                             publishProgress(AGREE,m.mid,m.msgTxt);
 //                                        }
                         }
                     }
-//                    else {
-//                        agreedMap.put(m.mid,1);
-//                    }
-//                }
+                if (!ackTimerTable.containsKey(m.mid)) {
+                    Log.e(TAG, "Here in processMsg ack! Timer Added! m.mid:" +m.mid + " from " + m.pid);
+                    Timer ackTimer = new Timer();
+                    ackTimer.schedule(new AckTimer(m.mid), ACK_MSG_TIMEOUT);
+                    ackTimerTable.put(m.mid, ackTimer);
+//                    if(ackTimerTable.containsKey(m.mid)) Log.e(TAG,"Here Element added! "  +m.mid + " from " + m.pid);
+                }
 
             } else if (AGREE.equals(m.type)) {
                 Log.e(TAG, "Here in processMsg agree!");
-                MY_EID = Math.max(MY_EID, m.eid);
-                update(m.mid, m.eid, m.pid);
+//                MY_EID = Math.max(MY_EID, m.eid);
+                update(m.mid, m.eid, m.pid, 1);
                 deliveredSet.add(m.mid);
                 deliver();
+//                publishProgress(DELIVER,"","");
+//                Timer agreeTimer = agreeTimerTable.get(m.mid);
+//                if (agreeTimer != null) {
+//                    agreeTimer.cancel();
+//                    agreeTimer.purge();
+//                }
             }
             return null;
         }
 
-        public void update(String mid, int eid, int pid) {
-            // update idMap and msgQueue
-            Message1 m = idMap.get(mid);
-            msgQueue.remove(m);
-            m.eid = eid;
-            m.pid = pid;
-            msgQueue.offer(m);
+
+        public synchronized void update(String mid, int eid, int pid, int op) {
+            // update idMap and msgQueue, op = 0 add ; op = 1 update
+//            if (op == 1) {
+            // Bug that helps! - if due to MSG_TIMEOUT, message is removed from queue in AgreeTimer,
+            // it is added again here. Doesnt Help!! gets popped and messes up the order
+                Message1 m = idMap.get(mid);
+
+                boolean exist = msgQueue.remove(m);
+                m.eid = eid;
+                m.pid = pid;
+                if (exist)
+                    msgQueue.offer(m);
+
         }
-/*
-        public void updateQueue(String mid, int eid, int pid) {
-            Message1 m = idMap.get(mid);
-            msgQueue.remove(m);
-            m.eid = eid;
-            m.pid = pid;
-            msgQueue.offer(m);
-        }
-*/
-        public void deliver() {
+
+        public synchronized void deliver() {
             //while queue is not empty or deliveredSet.contains(queue.peek())
             //queue.pop() and display message
             Log.e(TAG, "Here in deliver!");
-            Log.e(TAG, "Queue: " +msgQueue.peek().mid);
-            for (String s : deliveredSet) {
-                Log.e(TAG, "delSet:" + s);
+            if (msgQueue.peek() != null) {
+                Log.e(TAG, "Queue: " + msgQueue.peek().mid);
             }
-            while(!msgQueue.isEmpty()&&deliveredSet.contains(msgQueue.peek().mid)) {
-                Log.e(TAG, "publishing deliver!");
-                Message1 m = msgQueue.poll();
-                publishProgress(DELIVER,m.mid,m.msgTxt);
+//            for (String s : deliveredSet) {
+//                Log.e(TAG, "delSet:" + s);
+//            }
+            publishProgress(DELIVER,"","");
 
-            }
         }
 
-        protected void onProgressUpdate(String...strings) {
+        protected synchronized void onProgressUpdate(String...strings) {
             Log.e(TAG, "Here in processMsg progress!");
             String type = strings[0];
             String mid = strings[1];
             String msgTxt = strings[2];
+            Message1 m = idMap.get(mid);
             if (DELIVER.equals(type)) {
                 Log.e(TAG, "on progress deliver!");
-                TextView tv = (TextView) findViewById(R.id.textView1);
-                tv.append(msgTxt + "\t\n");
-                ContentValues contentValues = new ContentValues();
-                contentValues.put(KEY_FIELD, String.valueOf(++id));
-                contentValues.put(VALUE_FIELD, msgTxt);
-                getContentResolver().insert(mUri, contentValues);
+                while(!msgQueue.isEmpty() && deliveredSet.contains(msgQueue.peek().mid)) {
+                    Log.e(TAG, "publishing deliver!");
+                    m = msgQueue.poll();
+                    msgTxt = m.msgTxt;
+                    mid = m.mid;
+
+                    TextView tv = (TextView) findViewById(R.id.textView1);
+                    tv.append((id + 1) + " | " + msgTxt + " | " + m.eid + "." + m.pid + " | " + m.mid + "\t\n");
+                    ContentValues contentValues = new ContentValues();
+                    contentValues.put(KEY_FIELD, String.valueOf(++id));
+                    contentValues.put(VALUE_FIELD, msgTxt);
+                    getContentResolver().insert(mUri, contentValues);
+                }
             } else if (ACK.equals(type)) {
                 Log.e(TAG, "Here in processMsg progress ack!");
+                TextView tv = (TextView) findViewById(R.id.textView1);
                 new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msgTxt, "", type, mid);
+                tv.append(ACK + " send| " + " | " + m.eid +"."+ MY_PID + " | " + m.mid + "\t\n");
             } else if (AGREE.equals(type)) {
                 Log.e(TAG, "Here in processMsg progress agree!");
+                TextView tv = (TextView) findViewById(R.id.textView1);
                 new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msgTxt, "", type, mid);
+                HashSet<Message1> set = agreedMap.get(mid);
+                StringBuilder out = new StringBuilder();
+                for (Message1 s : set) {
+                    out.append(s.eid + "." +s.pid +",");
+                }
+                agreedMap.remove(m.mid);
+                tv.append(AGREE + " set| " + out.toString() + "\t\n");
+                tv.append(AGREE + " send| " + " | " + m.eid + "." + m.pid + " | " + m.mid + "\t\n");
             }
+        }
+        public class AgreeTimer extends TimerTask {
+            String mid;
+            public AgreeTimer(String mid) {
+                this.mid = mid;
+            }
+            public void run() {
+                Log.e(TAG,"Here in Agree Timer! mid:" + mid);
+                StringBuilder sb = new StringBuilder();
+                for (String s : deliveredSet) {
+                    sb.append(s + ",");
+                }
+                Log.e(TAG, "delSet:" + sb.toString());
+                if (!deliveredSet.contains(mid)) {
+                    msgQueue.remove(idMap.get(mid));
+                    Log.e(TAG,"Here in Agree Timer! Element Removed!");
+                }
+                deliver();
+//                publishProgress(DELIVER,"","");
+            }
+        }
+    }
+
+
+//    public class AgreeTimer extends TimerTask {
+//        String mid;
+//        public AgreeTimer(String mid) {
+//            this.mid = mid;
+//        }
+//        public void run() {
+//            Log.e(TAG,"Here in Agree Timer! mid:" + mid);
+//            StringBuilder sb = new StringBuilder();
+//            for (String s : deliveredSet) {
+//                sb.append(s + ",");
+//            }
+//            Log.e(TAG, "delSet:" + sb.toString());
+//            if (!deliveredSet.contains(mid)) {
+//                msgQueue.remove(idMap.get(mid));
+//                Log.e(TAG,"Here in Agree Timer! Element removed!");
+//            }
+//        }
+//    }
+
+    public class AckTimer extends TimerTask {
+        String mid;
+        public AckTimer(String mid) {
+            this.mid = mid;
+        }
+        public void run() {
+            Log.e(TAG,"Here in Ack Timer! mid:" + mid);
+            HashSet<Message1> set = agreedMap.get(mid);
+            if (set != null) {
+                agreedMap.remove(mid);
+                Log.e(TAG,"Here in Ack Timer! Removed mid:" + mid + ", Set size:" +set.size());
+                int max_eid = -1, max_pid = -1;
+                for (Message1 ms : set) {
+                    if (ms.eid > max_eid ||
+                            (ms.eid == max_eid && ms.pid > max_pid)) {
+                        max_eid = ms.eid;
+                        max_pid = ms.pid;
+                    }
+                }
+                update(mid, max_eid, max_pid, 1);
+                new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, "", "", AGREE, mid);
+
+            }
+        }
+        public void update(String mid, int eid, int pid, int op) {
+            // update idMap and msgQueue, op = 0 add ; op = 1 update
+            Message1 m = idMap.get(mid);
+            msgQueue.remove(m);
+            m.eid = eid;
+            m.pid = pid;
+            msgQueue.offer(m);
         }
 
     }
@@ -370,9 +484,9 @@ public class GroupMessengerActivity extends Activity {
         public void send(String... msgs) {
             String type = msgs[2];
             if (NEW.equals(type)) {
-                Log.e(TAG,"Here in client Task new!");
+
                 String msg = msgs[0];
-//                ++MY_EID;
+                ++MY_EID;
                 Message1 m = new Message1(msg,getMid(),MY_EID,MY_PID,type);
 //                agreedMap.put(m.mid, 1);
 //                msgSet.add(m.mid);
@@ -380,10 +494,12 @@ public class GroupMessengerActivity extends Activity {
                 //queue add
 //                msgQueue.offer(m);
 //                outMulticast(m,msgs);
-                bMulticast(m,0,msgs);
+                Log.e(TAG,"Here in client task new! m.mid:" + m.mid);
+                bMulticast(m, 0, msgs);
+
             }
             else if (ACK.equals(type)) {
-                Log.e(TAG,"Here in client Task ack!");
+                Log.e(TAG,"Here in client Task ack! m.mid:" + msgs[3]);
                 String mid = msgs[3];
                 Message1 m = idMap.get(mid);
                 if (m== null) {
@@ -393,14 +509,18 @@ public class GroupMessengerActivity extends Activity {
                 m.type = type;
                 m.pid = MY_PID;
                 sendAck(m,remotePort);
+
+
             }
             else if (AGREE.equals(type)) {
-                Log.e(TAG,"Here in client Task agree!");
+                Log.e(TAG,"Here in client Task agree! m.mid:" + msgs[3]);
                 String mid = msgs[3];
                 Message1 m = idMap.get(mid);
-                MY_EID = Math.max(m.eid, MY_EID);
+//                MY_EID = Math.max(m.eid, MY_EID);
                 m.type = type;
+
                 bMulticast(m,0,msgs);
+
             }
         }
         public void sendAck(Message1 m, int remotePort) {
@@ -411,15 +531,30 @@ public class GroupMessengerActivity extends Activity {
                 Socket socket = new Socket();
                 socket.connect(new InetSocketAddress(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                         remotePort),REQ_TIMEOUT);
-                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                out.writeObject(m);
+                OutputStream out = socket.getOutputStream();
+//                DataOutputStream dOut = new DataOutputStream(new BufferedOutputStream(out));
+                BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(out));
+                StringBuffer strMsg = new StringBuffer();
+                strMsg.append(m.mid);
+                strMsg.append(",");
+                strMsg.append(m.eid);
+                strMsg.append(",");
+                strMsg.append(m.pid);
+                strMsg.append(",");
+                strMsg.append(m.type);
+                strMsg.append(",");
+                strMsg.append(m.msgTxt);
+                bw.write(strMsg.toString());
+                bw.close();
+//                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+//                out.writeObject(m);
                 socket.close();
             } catch (SocketTimeoutException e) {
                 Log.e(TAG, "Client Socket Timeout exception Ack!");
-                if (!REMOTE_PORTS.isEmpty()) {
-                    REMOTE_PORTS.remove(String.valueOf(remotePort));
-                    NO_OF_PROCS--;
-                }
+//                if (!REMOTE_PORTS.isEmpty() && REMOTE_PORTS.contains(String.valueOf(remotePort))) {
+//                    REMOTE_PORTS.remove(String.valueOf(remotePort));
+//                    NO_OF_PROCS--;
+//                }
 
             } catch (UnknownHostException e) {
                 Log.e(TAG, "Client Unknown host exception!");
@@ -428,71 +563,74 @@ public class GroupMessengerActivity extends Activity {
                 e.printStackTrace();
             }
         }
-        /*public void outMulticast(Message1 m, String... msgs) {
-            try {
-                Log.e(TAG,"Here in outMulticast!");
-                Socket socket;
-                ObjectOutputStream out;
-                for(String remotePort : REMOTE_PORTS) {
-                    if (Integer.parseInt(remotePort) != MY_PID) {
-                    socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                            Integer.parseInt(remotePort));
-                    OutputStream outS = socket.getOutputStream();
-                    out = new ObjectOutputStream(outS);
-                    out.writeObject(m);
-                    out.close();
-                    socket.close();
-                    }
-                }
-            } catch (UnknownHostException e) {
-                Log.e(TAG, "Client Unknown host exception!");
-            } catch (IOException e) {
-                Log.e(TAG, "Client Socket io exception!");
-                e.printStackTrace();
-            }
-        }*/
+
 
         public void bMulticast(Message1 m, int count, String... msgs) {
             String remotePort = null;
-            try {
+//            try {
                 Log.e(TAG,"Here in client Task bmulti!");
                 Socket socket;
 //                OutputStream out;
 //                DataOutputStream dOut;
                 ObjectOutputStream out;
 //                String ownPort = msgs[1];
+//                ArrayList<String> removeList = new ArrayList<String>();
                 for(;count < REMOTE_PORTS.size(); count++) {
-                    remotePort = REMOTE_PORTS.get(count);
+                    try {
+                        remotePort = REMOTE_PORTS.get(count);
 //                    if (!ownPort.equals(remotePort)) {
 //                    socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
 //                            Integer.parseInt(remotePort));
 
-                    socket = new Socket();
-                    socket.connect(new InetSocketAddress(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                            Integer.parseInt(remotePort)), REQ_TIMEOUT);
+                        socket = new Socket();
+                        socket.connect(new InetSocketAddress(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+                                Integer.parseInt(remotePort)), REQ_TIMEOUT);
 //                    byte[] msgToSend = msgs[0].getBytes();
 //                    dOut = new DataOutputStream(out);
 //                    dOut.write(msgToSend);
-                    OutputStream outS = socket.getOutputStream();
-                    out = new ObjectOutputStream(outS);
-                    out.writeObject(m);
-                    out.close();
-                    socket.close();
+                        OutputStream outS = socket.getOutputStream();
+
+                        BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(outS));
+                        StringBuffer strMsg = new StringBuffer();
+                        strMsg.append(m.mid);
+                        strMsg.append(",");
+                        strMsg.append(m.eid);
+                        strMsg.append(",");
+                        strMsg.append(m.pid);
+                        strMsg.append(",");
+                        strMsg.append(m.type);
+                        strMsg.append(",");
+                        strMsg.append(m.msgTxt);
+                        Log.e(TAG, "msg Sent:"+strMsg.toString());
+                        bw.write(strMsg.toString());
+                        bw.flush();
+                        bw.close();
+//                        out = new ObjectOutputStream(outS);
+//                        out.writeObject(m);
+//                        out.close();
+                        socket.close();
+                    } catch (SocketTimeoutException e) {
+                        Log.e(TAG, "Client Socket Timeout exception!");
+//                        if (remotePort != null && !REMOTE_PORTS.isEmpty() && REMOTE_PORTS.contains(remotePort)) {
+//                            removeList.add(remotePort);
+//                        }
+                    } catch (UnknownHostException e) {
+                        Log.e(TAG, "Client Unknown host exception!");
+                    } catch (IOException e) {
+                        Log.e(TAG, "Client Socket IO exception!");
+                    }
 //                    }
                 }
-            }  catch (SocketTimeoutException e) {
-                Log.e(TAG, "Client Socket Timeout exception!");
-                if (remotePort != null && !REMOTE_PORTS.isEmpty()) {
-                    REMOTE_PORTS.remove(remotePort);
-                    NO_OF_PROCS --;
-//                    bMulticast(m,++count,msgs);
-                }
-            }  catch (UnknownHostException e) {
-                Log.e(TAG, "Client Unknown host exception!");
-            } catch (IOException e) {
-                Log.e(TAG, "Client Socket io exception!");
-                e.printStackTrace();
-            }
+//                for (String removeItem: removeList) {
+//                    REMOTE_PORTS.remove(removeItem);
+//                    NO_OF_PROCS --;
+//                }
+//            }  catch (UnknownHostException e) {
+//                Log.e(TAG, "Client Unknown host exception!");
+//            } catch (IOException e) {
+//                Log.e(TAG, "Client Socket io exception!");
+////                e.printStackTrace();
+//            }
         }
 
 

@@ -22,7 +22,7 @@ import android.util.Log;
  * There are two methods you need to implement---insert() and query(). Others are optional and
  * will not be tested.
  * 
- * @author stevko
+ * @author stevko, avinavsh
  *
  */
 public class GroupMessengerProvider extends ContentProvider {
